@@ -19,13 +19,23 @@ jobs:
         with:
           gradle-version: "9.5.1"
 
+      - name: Pokaz pliki
+        run: find . -not -path './.git/*' -not -path './.git' | head -60
+
       - name: Build
-        run: gradle build
+        run: |
+          SETTINGS=$(find . -name settings.gradle -not -path './.git/*' | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "BRAK PLIKU settings.gradle W REPOZYTORIUM - pliki nie zostaly wgrane"
+            exit 1
+          fi
+          cd "$(dirname "$SETTINGS")"
+          gradle build
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
           name: stats-mod
           path: |
-            build/libs/stats-*.jar
-            !build/libs/*-sources.jar
+            **/build/libs/stats-*.jar
+            !**/build/libs/*-sources.jar
