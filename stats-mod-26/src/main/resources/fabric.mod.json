@@ -1,0 +1,19 @@
+{
+	"schemaVersion": 1,
+	"id": "stats",
+	"version": "${version}",
+	"name": "Stats",
+	"description": "Naciśnij B, aby zobaczyć statystyki: zgony, zabójstwa, kto Cię uderzył i kto Cię zabił (osobno dla każdego serwera).",
+	"authors": ["Stats"],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["pl.stats.StatsClient"]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.0",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
