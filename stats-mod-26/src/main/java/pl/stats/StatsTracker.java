@@ -117,6 +117,7 @@ public final class StatsTracker {
 		if (best != null) {
 			String name = best.getName().getString();
 			data.hits.merge(name, 1, Integer::sum);
+			FaceUtil.remember(name);
 			lastHitter = name;
 			lastHitTime = System.currentTimeMillis();
 			save();
@@ -141,6 +142,7 @@ public final class StatsTracker {
 
 		if (killer != null) {
 			data.killedBy.merge(killer, 1, Integer::sum);
+			FaceUtil.remember(killer);
 		}
 		pendingDeathTime = now;
 		pendingDeathKiller = killer;
@@ -171,7 +173,10 @@ public final class StatsTracker {
 			if (pendingDeathTime > 0 && now - pendingDeathTime < 3000) {
 				if (pendingGuess) {
 					if (pendingDeathKiller != null) dec(data.killedBy, pendingDeathKiller);
-					if (killer != null) data.killedBy.merge(killer, 1, Integer::sum);
+					if (killer != null) {
+						data.killedBy.merge(killer, 1, Integer::sum);
+						FaceUtil.remember(killer);
+					}
 					pendingDeathKiller = killer;
 					pendingGuess = false;
 				}
