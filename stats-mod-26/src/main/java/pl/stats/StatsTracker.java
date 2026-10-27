@@ -2,6 +2,9 @@ package pl.stats;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ServerData;
@@ -17,7 +20,10 @@ import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -30,7 +36,9 @@ import java.util.Map;
 public final class StatsTracker {
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-	private static StatsData data = new StatsData();
+	private static StatsStore store = new StatsStore();
+	/** Statystyki aktywnego profilu. */
+	private static StatsData data = store.profiles.get(store.active);
 	private static String loadedKey = null;
 
 	private static boolean wasDead = false;
@@ -78,11 +86,18 @@ public final class StatsTracker {
 			}
 		}
 
-		boolean dead = p.getHealth() <= 0.0f;
+		boolean deathScreen = client.gui.screen() != null
+			&& client.gui.screen().getClass().getSimpleName().contains("Death");
+		boolean dead = p.getHealth() <= 0.0f || deathScreen;
 		if (dead && !wasDead) {
 			onDeath();
 		}
 		wasDead = dead;
+
+		// zapas: była wiadomość o śmierci, a zgonu nie wykryto po zdrowiu -> zalicz po chwili
+		if (msgValid && System.currentTimeMillis() - msgTime > 1500) {
+			onDeath();
+		}
 
 		if (!dead) {
 			int ht = p.hurtTime;
@@ -126,18 +141,26 @@ public final class StatsTracker {
 
 	private static void onDeath() {
 		long now = System.currentTimeMillis();
+		if (pendingDeathTime > 0 && now - pendingDeathTime < 5000) {
+			msgValid = false; // ten zgon został już policzony
+			return;
+		}
 		data.deaths++;
 
 		String killer = null;
+		String how = "brak danych";
 		boolean guess = false;
-		if (msgValid && now - msgTime < 3000 && msgKiller != null) {
+		if (msgValid && now - msgTime < 5000 && msgKiller != null) {
 			killer = msgKiller;
+			how = "wiadomość o śmierci";
 		} else if (lastHitter != null && now - lastHitTime < 10000) {
 			killer = lastHitter;
+			how = "ostatnie uderzenie";
 			guess = true;
 		} else {
 			// brak wiadomości i uderzeń (np. kryształ, TNT): zabójcą jest najbliższy gracz w promieniu 10 bloków
 			killer = nearestPlayerName(10.0);
+			how = killer == null ? "nikt w promieniu 10 bloków" : "najbliższy gracz (10 bloków)";
 			guess = true;
 		}
 		msgValid = false;
@@ -150,6 +173,16 @@ public final class StatsTracker {
 		pendingDeathKiller = killer;
 		pendingGuess = guess;
 		save();
+		say("[Stats] Zgon zapisany. Zabójca: " + (killer == null ? "nie wykryto" : killer) + " (" + how + ")");
+	}
+
+	/** Krótka informacja na czacie (tylko dla Ciebie), żeby było widać, co mod wykrył. */
+	private static void say(String text) {
+		try {
+			LocalPlayer me = Minecraft.getInstance().player;
+			if (me != null) me.sendSystemMessage(Component.literal(text));
+		} catch (Throwable ignored) {
+		}
 	}
 
 	/** Nick najbliższego innego gracza w podanym promieniu (w blokach) albo null. */
@@ -178,7 +211,10 @@ public final class StatsTracker {
 		if (client.player == null) return;
 
 		TranslatableContents tc = findDeath(message);
-		if (tc == null) return;
+		if (tc == null) {
+			plainTextFallback(client, message);
+			return;
+		}
 		Object[] args = tc.getArgs();
 		if (args.length == 0) return;
 
@@ -211,6 +247,34 @@ public final class StatsTracker {
 		} else if (other != null && isMe(other, me)) {
 			data.kills++;
 			save();
+		}
+	}
+
+	/**
+	 * Serwery z własnymi wiadomościami o śmierci (zwykły tekst): jeśli tuż po Twoim zgonie
+	 * przyjdzie wiadomość z Twoim nickiem i nickiem innego gracza, uznajemy go za zabójcę.
+	 */
+	private static void plainTextFallback(Minecraft client, Component message) {
+		long now = System.currentTimeMillis();
+		if (pendingDeathTime <= 0 || now - pendingDeathTime > 3000 || !pendingGuess) return;
+		String text = strip(message.getString());
+		if (text.length() > 200) return;
+		String me = client.player.getName().getString();
+		if (!isMe(text, me)) return;
+		for (String raw : text.split("\\s+")) {
+			String token = raw.replaceAll("[^A-Za-z0-9_]", "");
+			if (token.length() < 3 || token.equalsIgnoreCase(me)) continue;
+			String found = resolvePlayer(client, token);
+			if (found != null) {
+				if (pendingDeathKiller != null) dec(data.killedBy, pendingDeathKiller);
+				data.killedBy.merge(found, 1, Integer::sum);
+				FaceUtil.remember(found);
+				pendingDeathKiller = found;
+				pendingGuess = false;
+				save();
+				say("[Stats] Zabójca poprawiony z wiadomości serwera: " + found);
+				return;
+			}
 		}
 	}
 
@@ -275,20 +339,37 @@ public final class StatsTracker {
 		if (key.equals(loadedKey)) return;
 		save();
 		loadedKey = key;
-		data = new StatsData();
+		store = new StatsStore();
 		Path f = fileFor(key);
 		if (Files.exists(f)) {
 			try (Reader r = Files.newBufferedReader(f, StandardCharsets.UTF_8)) {
-				StatsData loaded = GSON.fromJson(r, StatsData.class);
-				if (loaded != null) {
-					if (loaded.hits == null) loaded.hits = new LinkedHashMap<>();
-					if (loaded.killedBy == null) loaded.killedBy = new LinkedHashMap<>();
-					data = loaded;
+				JsonElement el = JsonParser.parseReader(r);
+				if (el != null && el.isJsonObject()) {
+					JsonObject o = el.getAsJsonObject();
+					if (o.has("profiles")) {
+						StatsStore loaded = GSON.fromJson(o, StatsStore.class);
+						if (loaded != null) store = loaded;
+					} else {
+						// stary format (jeden zestaw statystyk) -> profil "Domyślny"
+						StatsData old = GSON.fromJson(o, StatsData.class);
+						store = new StatsStore();
+						if (old != null) store.profiles.put(StatsStore.DEFAULT_NAME, old);
+					}
 				}
 			} catch (IOException | RuntimeException e) {
 				e.printStackTrace();
 			}
 		}
+		store.fix();
+		refreshData();
+		resetState();
+	}
+
+	private static void refreshData() {
+		data = store.profiles.get(store.active);
+	}
+
+	private static void resetState() {
 		wasDead = false;
 		lastHitter = null;
 		msgValid = false;
@@ -301,10 +382,68 @@ public final class StatsTracker {
 		try {
 			Files.createDirectories(f.getParent());
 			try (Writer w = Files.newBufferedWriter(f, StandardCharsets.UTF_8)) {
-				GSON.toJson(data, w);
+				GSON.toJson(store, w);
 			}
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
+	}
+
+	// ------------------------------------------------------------------ profile (dla ustawień)
+
+	public static List<String> profileNames() {
+		return new ArrayList<>(store.profiles.keySet());
+	}
+
+	public static String activeProfile() {
+		return store.active;
+	}
+
+	public static void selectProfile(String name) {
+		if (!store.profiles.containsKey(name) || name.equals(store.active)) return;
+		store.active = name;
+		refreshData();
+		resetState();
+		save();
+	}
+
+	/** Dodaje i wybiera nowy profil. Zwraca tekst błędu albo null, gdy się udało. */
+	public static String addProfile(String rawName) {
+		String name = rawName == null ? "" : rawName.trim();
+		if (name.isEmpty()) return "Wpisz nazwę profilu.";
+		if (name.length() > 20) return "Nazwa może mieć maksymalnie 20 znaków.";
+		for (String existing : store.profiles.keySet()) {
+			if (existing.equalsIgnoreCase(name)) return "Profil o takiej nazwie już istnieje.";
+		}
+		store.profiles.put(name, new StatsData());
+		store.active = name;
+		refreshData();
+		resetState();
+		save();
+		return null;
+	}
+
+	/** Kolejna wolna nazwa "Profil N" (gdy nie da się wpisać nazwy ręcznie). */
+	public static String autoProfileName() {
+		int n = store.profiles.size() + 1;
+		while (true) {
+			String candidate = "Profil " + n;
+			boolean taken = false;
+			for (String existing : store.profiles.keySet()) {
+				if (existing.toLowerCase(Locale.ROOT).equals(candidate.toLowerCase(Locale.ROOT))) taken = true;
+			}
+			if (!taken) return candidate;
+			n++;
+		}
+	}
+
+	/** Usuwa profil. Gdy to był ostatni, powstaje nowy pusty "Domyślny". */
+	public static void deleteProfile(String name) {
+		if (!store.profiles.containsKey(name)) return;
+		store.profiles.remove(name);
+		store.fix();
+		refreshData();
+		resetState();
+		save();
 	}
 }
