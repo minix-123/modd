@@ -130,12 +130,14 @@ public final class StatsTracker {
 
 		String killer = null;
 		boolean guess = false;
-		if (msgValid && now - msgTime < 3000) {
+		if (msgValid && now - msgTime < 3000 && msgKiller != null) {
 			killer = msgKiller;
 		} else if (lastHitter != null && now - lastHitTime < 10000) {
 			killer = lastHitter;
 			guess = true;
 		} else {
+			// brak wiadomości i uderzeń (np. kryształ, TNT): zabójcą jest najbliższy gracz w promieniu 10 bloków
+			killer = nearestPlayerName(10.0);
 			guess = true;
 		}
 		msgValid = false;
@@ -148,6 +150,24 @@ public final class StatsTracker {
 		pendingDeathKiller = killer;
 		pendingGuess = guess;
 		save();
+	}
+
+	/** Nick najbliższego innego gracza w podanym promieniu (w blokach) albo null. */
+	private static String nearestPlayerName(double radius) {
+		Minecraft client = Minecraft.getInstance();
+		LocalPlayer me = client.player;
+		if (me == null || client.level == null) return null;
+		AbstractClientPlayer best = null;
+		double bestDist = radius;
+		for (AbstractClientPlayer other : client.level.players()) {
+			if (other.getUUID().equals(me.getUUID())) continue;
+			double d = other.distanceTo(me);
+			if (d <= bestDist) {
+				bestDist = d;
+				best = other;
+			}
+		}
+		return best == null ? null : best.getName().getString();
 	}
 
 	// ------------------------------------------------------------------ wiadomości o śmierci
@@ -171,7 +191,9 @@ public final class StatsTracker {
 		if (isMe(victim, me)) {
 			String killer = other == null ? null : resolvePlayer(client, other);
 			if (pendingDeathTime > 0 && now - pendingDeathTime < 3000) {
-				if (pendingGuess) {
+				// wiadomość o śmierci poprawia zgadnięcie tylko wtedy, gdy wskazuje konkretnego gracza;
+				// w przeciwnym razie zostaje najbliższy gracz z promienia 10 bloków
+				if (pendingGuess && killer != null) {
 					if (pendingDeathKiller != null) dec(data.killedBy, pendingDeathKiller);
 					if (killer != null) {
 						data.killedBy.merge(killer, 1, Integer::sum);
