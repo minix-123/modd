@@ -1,21 +1,24 @@
 package pl.stats;
 
 import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
-/** Neonowe okno otwierane klawiszem B: zakładki po lewej (Profil / Hit / Kill). */
+/** Neonowe okno otwierane klawiszem B: zakładki po lewej (Profil / Hit / Kill / Ustawienia). */
 public class StatsScreen extends Screen {
 	private enum Tab {
 		PROFIL("PROFIL", 0xFF00F0FF),
 		HIT("HIT", 0xFFFF2BD6),
-		KILL("KILL", 0xFFFF3860);
+		KILL("KILL", 0xFFFF3860),
+		USTAWIENIA("USTAWIENIA", 0xFFB45CFF);
 
 		final String label;
 		final int accent;
@@ -30,22 +33,42 @@ public class StatsScreen extends Screen {
 	private static final int BG_TOP = 0xF0130E2E;
 	private static final int BG_BOTTOM = 0xF0060612;
 	private static final int SIDEBAR = 0xF0070712;
+	private static final int BASE = 0xFF0B0B1A;
 	private static final int CARD = 0xFF10102A;
 	private static final int ROW = 0xB0141432;
 	private static final int WHITE = 0xFFEAF6FF;
 	private static final int DIM = 0xFF7F8CB0;
 	private static final int GREEN = 0xFF39FF88;
+	private static final int RED = 0xFFFF3860;
 	private static final int PURPLE = 0xFFB45CFF;
 
-	private static final int SIDEBAR_W = 100;
+	private static final int SIDEBAR_W = 108;
 	private static final int TAB_H = 28;
 	private static final int ROW_H = 30;
 	private static final int ROW_GAP = 4;
+
+	// ustawienia
+	private static final int PROF_ROWS = 3;
+	private static final int PROF_ROW_H = 22;
+	private static final int PROF_ROW_GAP = 2;
 
 	private Tab tab = Tab.PROFIL;
 	private double scroll = 0;
 
 	private int px, py, pw, ph;
+
+	private boolean needsRebuild = true;
+	private int builtStart = -1;
+
+	private boolean addMode = false;
+	private boolean confirmDelete = false;
+	private String msg = "";
+	private int msgColor = DIM;
+
+	// pole tekstowe (tworzone refleksją - gdyby się nie udało, nazwa profilu jest nadawana automatycznie)
+	private AbstractWidget nameBox = null;
+	private boolean boxFailed = false;
+	private String nameText = "";
 
 	public StatsScreen() {
 		super(Component.literal("Stats"));
@@ -60,16 +83,216 @@ public class StatsScreen extends Screen {
 
 	@Override
 	protected void init() {
+		needsRebuild = true;
+	}
+
+	// ------------------------------------------------------------------ widgety (niewidoczne przyciski do klikania)
+
+	private void hidden(int x, int y, int w, int h, Runnable action) {
+		Button b = Button.builder(Component.empty(), btn -> action.run()).bounds(x, y, w, h).build();
+		try {
+			b.getClass().getMethod("setAlpha", float.class).invoke(b, 0.0f);
+		} catch (Throwable ignored) {
+			// zasłaniamy je nieprzezroczystym tłem
+		}
+		this.addRenderableWidget(b);
+	}
+
+	private int cx() {
+		return px + SIDEBAR_W + 16;
+	}
+
+	private int cw() {
+		return pw - SIDEBAR_W - 32;
+	}
+
+	private int top() {
+		return py + 46;
+	}
+
+	// geometria ustawień
+	private int listY() {
+		return top() + 14;
+	}
+
+	private int btnY() {
+		return top() + 96;
+	}
+
+	private int addY() {
+		return top() + 124;
+	}
+
+	private int fieldY() {
+		return top() + 135;
+	}
+
+	private int saveY() {
+		return top() + 160;
+	}
+
+	private int msgY() {
+		return top() + 186;
+	}
+
+	private int half() {
+		return (cw() - 8) / 2;
+	}
+
+	private void rebuild() {
+		needsRebuild = false;
+		this.clearWidgets();
 		layout();
+
 		int i = 0;
 		for (Tab t : Tab.values()) {
-			// niewidoczne przyciski tylko obsługują kliknięcia; wygląd rysujemy sami
-			Button b = Button.builder(Component.empty(), btn -> {
-				tab = t;
+			final Tab target = t;
+			hidden(px + 8, py + 50 + i * (TAB_H + 6), SIDEBAR_W - 16, TAB_H, () -> {
+				tab = target;
 				scroll = 0;
-			}).bounds(px + 8, py + 50 + i * (TAB_H + 6), SIDEBAR_W - 16, TAB_H).build();
-			this.addRenderableWidget(b);
+				addMode = false;
+				confirmDelete = false;
+				msg = "";
+				needsRebuild = true;
+			});
 			i++;
+		}
+
+		if (tab == Tab.USTAWIENIA) buildSettings();
+	}
+
+	private void buildSettings() {
+		int cx = cx();
+		int cw = cw();
+		List<String> names = StatsTracker.profileNames();
+
+		int maxScroll = Math.max(0, names.size() - PROF_ROWS);
+		if (scroll < 0) scroll = 0;
+		if (scroll > maxScroll) scroll = maxScroll;
+		builtStart = (int) scroll;
+
+		for (int r = 0; r < PROF_ROWS; r++) {
+			int idx = builtStart + r;
+			if (idx >= names.size()) break;
+			final String n = names.get(idx);
+			hidden(cx, listY() + r * (PROF_ROW_H + PROF_ROW_GAP), cw, PROF_ROW_H, () -> {
+				StatsTracker.selectProfile(n);
+				confirmDelete = false;
+				msg = "";
+			});
+		}
+
+		hidden(cx, btnY(), half(), 22, this::onAddClicked);
+		hidden(cx + half() + 8, btnY(), half(), 22, this::onDeleteClicked);
+
+		if (addMode) {
+			createNameBox(cx + 3, fieldY() + 3, cw - 6, 14);
+			hidden(cx, saveY(), half(), 20, this::onSave);
+			hidden(cx + half() + 8, saveY(), half(), 20, () -> {
+				addMode = false;
+				msg = "";
+				needsRebuild = true;
+			});
+		}
+	}
+
+	private void onAddClicked() {
+		confirmDelete = false;
+		if (boxFailed) {
+			// brak pola tekstowego: nazwa automatyczna
+			StatsTracker.addProfile(StatsTracker.autoProfileName());
+			msg = "Dodano profil: " + StatsTracker.activeProfile();
+			msgColor = GREEN;
+			needsRebuild = true;
+			return;
+		}
+		addMode = true;
+		nameText = "";
+		msg = "";
+		needsRebuild = true;
+	}
+
+	private void onSave() {
+		String err = StatsTracker.addProfile(nameText);
+		if (err != null) {
+			msg = err;
+			msgColor = RED;
+		} else {
+			msg = "Dodano i wybrano profil: " + StatsTracker.activeProfile();
+			msgColor = GREEN;
+			addMode = false;
+			nameText = "";
+			needsRebuild = true;
+		}
+	}
+
+	private void onDeleteClicked() {
+		if (!confirmDelete) {
+			confirmDelete = true;
+			msg = "Kliknij USUŃ PROFIL jeszcze raz, aby potwierdzić.";
+			msgColor = RED;
+		} else {
+			String name = StatsTracker.activeProfile();
+			StatsTracker.deleteProfile(name);
+			confirmDelete = false;
+			scroll = 0;
+			msg = "Usunięto profil: " + name;
+			msgColor = GREEN;
+			needsRebuild = true;
+		}
+	}
+
+	// ------------------------------------------------------------------ pole tekstowe (refleksja)
+
+	private void createNameBox(int x, int y, int w, int h) {
+		nameBox = null;
+		if (boxFailed) return;
+		try {
+			Class<?> c = Class.forName("net.minecraft.client.gui.components.EditBox");
+			for (Constructor<?> k : c.getConstructors()) {
+				Class<?>[] p = k.getParameterTypes();
+				if (p.length != 6) continue;
+				if (!p[0].isInstance(this.font)) continue;
+				if (p[1] != int.class || p[2] != int.class || p[3] != int.class || p[4] != int.class) continue;
+				if (!p[5].isAssignableFrom(Component.class)) continue;
+				Object o = k.newInstance(this.font, x, y, w, h, Component.empty());
+				nameBox = (AbstractWidget) o;
+				break;
+			}
+			if (nameBox == null) {
+				boxFailed = true;
+				return;
+			}
+			call(nameBox, "setMaxLength", int.class, 20);
+			call(nameBox, "setValue", String.class, nameText);
+			this.addRenderableWidget(nameBox);
+			this.setFocused(nameBox);
+			try {
+				nameBox.setFocused(true);
+			} catch (Throwable ignored) {
+			}
+		} catch (Throwable t) {
+			nameBox = null;
+			boxFailed = true;
+			addMode = false;
+		}
+	}
+
+	private static void call(Object target, String method, Class<?> type, Object arg) {
+		try {
+			Method m = target.getClass().getMethod(method, type);
+			m.invoke(target, arg);
+		} catch (Throwable ignored) {
+		}
+	}
+
+	private String readNameBox() {
+		if (nameBox == null) return nameText;
+		try {
+			Object v = nameBox.getClass().getMethod("getValue").invoke(nameBox);
+			return v == null ? "" : v.toString();
+		} catch (Throwable t) {
+			return nameText;
 		}
 	}
 
@@ -124,7 +347,6 @@ public class StatsScreen extends Screen {
 		return mx >= x && mx < x + w && my >= y && my < y + h;
 	}
 
-	/** Szerokość tekstu po przeskalowaniu. */
 	private int bigWidth(String s, float scale) {
 		return (int) (this.font.width(s) * scale);
 	}
@@ -149,12 +371,30 @@ public class StatsScreen extends Screen {
 		}
 	}
 
+	/** Neonowy przycisk (rysowany nad niewidocznym przyciskiem, który odbiera kliknięcie). */
+	private void drawButton(GuiGraphicsExtractor g, int mouseX, int mouseY, int x, int y, int w, int h,
+							String label, int color, boolean strong) {
+		boolean hover = inside(mouseX, mouseY, x, y, w, h);
+		g.fill(x, y, x + w, y + h, BASE);
+		g.fill(x, y, x + w, y + h, alpha(color, strong ? 0x55 : (hover ? 0x35 : 0x1A)));
+		border(g, x, y, x + w, y + h, alpha(color, hover || strong ? 0xFF : 0xA0));
+		g.fill(x, y + h - 2, x + w, y + h, alpha(color, hover || strong ? 0xFF : 0x80));
+		int tx = x + (w - this.font.width(label)) / 2;
+		g.text(this.font, label, tx, y + (h - 8) / 2, hover || strong ? WHITE : color, false);
+	}
+
 	// ------------------------------------------------------------------ rysowanie
 
 	@Override
 	public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
+		layout();
+		if (tab == Tab.USTAWIENIA && (int) Math.max(0, scroll) != builtStart) needsRebuild = true;
+		if (needsRebuild) rebuild();
+
 		super.extractRenderState(g, mouseX, mouseY, delta);
 		layout();
+
+		if (addMode) nameText = readNameBox();
 
 		int accent = tab.accent;
 
@@ -189,6 +429,8 @@ public class StatsScreen extends Screen {
 			boolean active = t == tab;
 			boolean hover = inside(mouseX, mouseY, bx, by, bw, TAB_H);
 
+			g.fill(bx - 2, by - 2, bx + bw + 2, by + TAB_H + 2, SIDEBAR);
+			g.fill(bx, by, bx + bw, by + TAB_H, BASE);
 			if (active) {
 				g.fill(bx - 2, by - 2, bx + bw + 2, by + TAB_H + 2, alpha(t.accent, 0x18));
 				g.fill(bx, by, bx + bw, by + TAB_H, alpha(t.accent, 0x30));
@@ -199,16 +441,14 @@ public class StatsScreen extends Screen {
 				border(g, bx, by, bx + bw, by + TAB_H, alpha(t.accent, 0x80));
 				g.fill(bx, by, bx + 2, by + TAB_H, alpha(t.accent, 0xAA));
 			} else {
-				g.fill(bx, by, bx + bw, by + TAB_H, 0xFF0B0B1A);
 				border(g, bx, by, bx + bw, by + TAB_H, 0xFF1C1C3A);
 			}
 
-			// kropka-ikona
 			int dot = active ? t.accent : (hover ? alpha(t.accent, 0xCC) : alpha(t.accent, 0x60));
 			g.fill(bx + 12, by + TAB_H / 2 - 3, bx + 18, by + TAB_H / 2 + 3, dot);
 
 			int color = active ? t.accent : (hover ? WHITE : DIM);
-			g.text(this.font, t.label, bx + 26, by + (TAB_H - 8) / 2, color, false);
+			g.text(this.font, t.label, bx + 24, by + (TAB_H - 8) / 2, color, false);
 			i++;
 		}
 
@@ -216,28 +456,99 @@ public class StatsScreen extends Screen {
 		g.text(this.font, hint, px + (SIDEBAR_W - this.font.width(hint)) / 2, py + ph - 16, alpha(DIM, 0xAA), false);
 
 		// ---------------------------------------------------------- zawartość
-		int cx = px + SIDEBAR_W + 16;
-		int cw = pw - SIDEBAR_W - 32;
+		int cx = cx();
+		int cw = cw();
 
 		bigText(g, tab.label, cx + 1, py + 13, alpha(accent, 0x60), 1.5f);
 		bigText(g, tab.label, cx, py + 12, accent, 1.5f);
 
 		String server = StatsTracker.currentServerKey();
-		if (server.length() > 30) server = server.substring(0, 29) + "...";
-		String serverLine = "serwer: " + server;
+		if (server.length() > 20) server = server.substring(0, 19) + "...";
+		String prof = StatsTracker.activeProfile();
+		if (prof.length() > 14) prof = prof.substring(0, 13) + "...";
+		String serverLine = server + "  |  " + prof;
 		g.text(this.font, serverLine, cx + cw - this.font.width(serverLine), py + 16, DIM, false);
 
 		g.fill(cx, py + 32, cx + cw, py + 33, alpha(accent, 0xCC));
 		g.fill(cx, py + 33, cx + cw, py + 35, alpha(accent, 0x25));
 
 		StatsData d = StatsTracker.data();
-		int top = py + 46;
+		int top = top();
 		int bottom = py + ph - 12;
 
 		switch (tab) {
 			case PROFIL -> drawProfile(g, d, cx, top, bottom, cw);
 			case HIT -> drawRanking(g, d.hits, "Nikt jeszcze Cię nie uderzył.", cx, top, bottom, cw, Tab.HIT.accent);
 			case KILL -> drawRanking(g, d.killedBy, "Nikt jeszcze Cię nie zabił.", cx, top, bottom, cw, Tab.KILL.accent);
+			case USTAWIENIA -> drawSettings(g, mouseX, mouseY, cx, cw);
+		}
+	}
+
+	// ------------------------------------------------------------------ ustawienia
+
+	private void drawSettings(GuiGraphicsExtractor g, int mouseX, int mouseY, int cx, int cw) {
+		int top = top();
+		g.text(this.font, "WYBÓR PROFILU (osobne statystyki na każdy tryb serwera)", cx, top + 2, DIM, false);
+
+		List<String> names = StatsTracker.profileNames();
+		String active = StatsTracker.activeProfile();
+
+		for (int r = 0; r < PROF_ROWS; r++) {
+			int idx = builtStart + r;
+			if (idx >= names.size()) break;
+			String n = names.get(idx);
+			boolean isActive = n.equals(active);
+			int y = listY() + r * (PROF_ROW_H + PROF_ROW_GAP);
+			boolean hover = inside(mouseX, mouseY, cx, y, cw, PROF_ROW_H);
+
+			g.fill(cx, y, cx + cw, y + PROF_ROW_H, BASE);
+			if (isActive) {
+				g.fill(cx, y, cx + cw, y + PROF_ROW_H, alpha(PURPLE, 0x30));
+				border(g, cx, y, cx + cw, y + PROF_ROW_H, alpha(PURPLE, 0xDD));
+				g.fill(cx, y, cx + 4, y + PROF_ROW_H, PURPLE);
+			} else {
+				g.fill(cx, y, cx + cw, y + PROF_ROW_H, hover ? alpha(PURPLE, 0x1C) : ROW);
+				border(g, cx, y, cx + cw, y + PROF_ROW_H, hover ? alpha(PURPLE, 0x90) : 0xFF1C1C3A);
+			}
+
+			g.text(this.font, n, cx + 12, y + (PROF_ROW_H - 8) / 2, isActive ? WHITE : (hover ? WHITE : DIM), false);
+			if (isActive) {
+				String tag = "AKTYWNY";
+				g.text(this.font, tag, cx + cw - 10 - this.font.width(tag), y + (PROF_ROW_H - 8) / 2, GREEN, false);
+			}
+		}
+
+		if (names.size() > PROF_ROWS) {
+			String more = "kółko myszy - więcej profili (" + (builtStart + 1) + "-"
+				+ Math.min(names.size(), builtStart + PROF_ROWS) + " z " + names.size() + ")";
+			g.text(this.font, more, cx, listY() + PROF_ROWS * (PROF_ROW_H + PROF_ROW_GAP) + 1, alpha(DIM, 0xAA), false);
+		}
+
+		drawButton(g, mouseX, mouseY, cx, btnY(), half(), 22, "+ DODAJ PROFIL", PURPLE, addMode);
+		drawButton(g, mouseX, mouseY, cx + half() + 8, btnY(), half(), 22,
+			confirmDelete ? "NA PEWNO? KLIKNIJ" : "USUŃ PROFIL", RED, confirmDelete);
+
+		if (addMode) {
+			g.text(this.font, "Nazwa nowego profilu (np. Survival, Bedwars):", cx, addY(), DIM, false);
+
+			int fy = fieldY();
+			g.fill(cx, fy, cx + cw, fy + 20, BASE);
+			g.fill(cx, fy, cx + cw, fy + 20, alpha(PURPLE, 0x14));
+			border(g, cx, fy, cx + cw, fy + 20, alpha(PURPLE, 0xCC));
+
+			String shown = nameText;
+			if (shown.isEmpty()) {
+				g.text(this.font, "wpisz nazwę...", cx + 6, fy + 6, alpha(DIM, 0x99), false);
+			}
+			boolean blink = (System.currentTimeMillis() / 500) % 2 == 0;
+			g.text(this.font, shown + (blink ? "_" : ""), cx + 6, fy + 6, WHITE, false);
+
+			drawButton(g, mouseX, mouseY, cx, saveY(), half(), 20, "ZAPISZ", GREEN, false);
+			drawButton(g, mouseX, mouseY, cx + half() + 8, saveY(), half(), 20, "ANULUJ", DIM, false);
+		}
+
+		if (!msg.isEmpty()) {
+			g.text(this.font, msg, cx, msgY(), msgColor, false);
 		}
 	}
 
@@ -305,7 +616,6 @@ public class StatsScreen extends Screen {
 			int count = e.getValue();
 			boolean first = i == 0;
 
-			// tło wiersza i pasek proporcjonalny do liczby
 			g.fill(cx, y, cx + cw, y + ROW_H, ROW);
 			int barW = Math.max(3, (int) ((cw - 2) * (count / (double) max)));
 			g.fill(cx + 1, y + 1, cx + barW, y + ROW_H - 1, alpha(color, 0x30));
@@ -313,7 +623,6 @@ public class StatsScreen extends Screen {
 			border(g, cx, y, cx + cw, y + ROW_H, alpha(color, first ? 0x90 : 0x40));
 			g.fill(cx, y, cx + 3, y + ROW_H, color);
 
-			// głowa gracza (z neonową ramką)
 			int hs = 20;
 			int hx = cx + 10;
 			int hy = y + (ROW_H - hs) / 2 - 1;
@@ -322,7 +631,6 @@ public class StatsScreen extends Screen {
 				drawFallbackAvatar(g, name, hx, hy, hs, color);
 			}
 
-			// numer, nick, liczba
 			String rank = "#" + (i + 1);
 			g.text(this.font, rank, hx + hs + 10, y + 5, first ? color : DIM, false);
 			g.text(this.font, name, hx + hs + 10, y + 16 - 1, WHITE, false);
@@ -344,7 +652,7 @@ public class StatsScreen extends Screen {
 	/** Awatar zastępczy: kolorowy kwadrat z pierwszą literą nicku. */
 	private void drawFallbackAvatar(GuiGraphicsExtractor g, String name, int x, int y, int size, int color) {
 		g.fill(x, y, x + size, y + size, alpha(color, 0x55));
-		g.fill(x + 2, y + 2, x + size - 2, y + size - 2, 0xFF0B0B1A);
+		g.fill(x + 2, y + 2, x + size - 2, y + size - 2, BASE);
 		String letter = name.isEmpty() ? "?" : name.substring(0, 1).toUpperCase();
 		g.text(this.font, letter, x + (size - this.font.width(letter)) / 2, y + (size - 8) / 2, color, false);
 	}
